@@ -8,6 +8,7 @@ services:
       - name: specs-combiner-route
         paths:
           - /specs-combiner
+        strip_path: true
 
   - name: user-service
     url: http://user:8007
@@ -15,6 +16,7 @@ services:
       - name: user-service-route
         paths:
           - /user-service
+        strip_path: true
 
   - name: product-service
     url: http://product:8002
@@ -22,6 +24,7 @@ services:
       - name: product-service-route
         paths:
           - /product-service
+        strip_path: true
 
   - name: order-service
     url: http://order:8003
@@ -29,6 +32,7 @@ services:
       - name: order-service-route
         paths:
           - /order-service
+        strip_path: true
 
   - name: notification-service
     url: http://notification:8004
@@ -36,6 +40,7 @@ services:
       - name: notification-service-route
         paths:
           - /notification-service
+        strip_path: true
 
   - name: inventory-service
     url: http://inventory:8005
@@ -43,6 +48,7 @@ services:
       - name: inventory-service-route
         paths:
           - /inventory-service
+        strip_path: true
 
   - name: payment-service
     url: http://payment:8006
@@ -50,3 +56,11 @@ services:
       - name: payment-service-route
         paths:
           - /payment-service
+        strip_path: true
+
+# Applied to every route: protects the services from floods.
+plugins:
+  - name: rate-limiting
+    config:
+      minute: 120
+      policy: local
