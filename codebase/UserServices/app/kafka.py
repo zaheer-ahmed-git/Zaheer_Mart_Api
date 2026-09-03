@@ -47,11 +47,16 @@ async def create_topic():
             num_partitions=2,
             replication_factor=1,
         ),
+        NewTopic(
+            name=f"{(settings.KAFKA_TOPIC_USER_REGISTERED).strip()}",
+            num_partitions=2,
+            replication_factor=1,
+        ),
     ]
     try:
         await admin_client.create_topics(new_topics=topic_list, validate_only=False)
     except Exception as e:
-        logger.error("Error creating topics:: {e}")
+        logger.error(f"Error creating topics: {e}")
     finally:
         await admin_client.close()
 
@@ -65,11 +70,11 @@ async def consume_message_response():
     await retry_async(consumer.start)
     try:
         async for msg in consumer:
-            logger.info(f"message from consumer in producer  : {msg}")
+            logger.debug("message received")
             try:
                 new_msg = user_pb2.User()
                 new_msg.ParseFromString(msg.value)
-                logger.info(f"new_msg on producer side:{new_msg}")
+                logger.debug("user message parsed")
                 return new_msg
             except Exception as e:
                 logger.error(f"Error Processing Message: {e} ")
@@ -86,11 +91,11 @@ async def consume_messages_user(topic, consumer_id):
     await retry_async(consumer.start)
     try:
         async for msg in consumer:
-            logger.info(f"message from consumer in producer  : {msg}")
+            logger.debug("message received")
             try:
                 new_msg = user_pb2.User()
                 new_msg.ParseFromString(msg.value)
-                logger.info(f"new_msg on producer side:{new_msg}")
+                logger.debug("user message parsed")
                 yield new_msg
             except Exception as e:
                 logger.error(f"Error Processing Message: {e} ")

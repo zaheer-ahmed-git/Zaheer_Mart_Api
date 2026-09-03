@@ -25,3 +25,8 @@ KAFKA_TOPIC_RESPONSE_FROM_USER_TO_ORDER = config(
 KAFKA_TOPIC_RESPONSE_FROM_USER_TO_PAYMENT = config(
     "KAFKA_TOPIC_RESPONSE_FROM_USER_TO_PAYMENT", cast=str
 )
+
+# Event published after a user is saved (consumed by the notification service).
+KAFKA_TOPIC_USER_REGISTERED = config(
+    "KAFKA_TOPIC_USER_REGISTERED", cast=str, default="user-registered"
+)

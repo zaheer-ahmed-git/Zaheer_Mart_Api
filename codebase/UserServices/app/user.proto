@@ -5,13 +5,18 @@ package user;
 enum SelectOption {
     GET = 0;
     GET_ALL = 1;
-    REGISTER=2;
-    LOGIN=3;
-    CURRENT_USER=4;
-    REFRESH_TOKEN=5;
-    CREATE = 6;
-    UPDATE =7;
-    DELETE =8;
+    ADD = 2;
+    REGISTER = 3;
+    LOGIN = 4;
+    CURRENT_USER = 5;
+    REFRESH_TOKEN = 6;
+    CREATE = 7;
+    UPDATE = 8;
+    REDUCE = 9;
+    DELETE = 10;
+    PAYMENT_DONE = 11;
+    CHECK = 12;
+    CHECK_BY_PRODUCT = 13;
 }
 
 enum SelectService{
@@ -33,6 +38,7 @@ message User {
     int64 http_status_code = 11;
     string shipping_address = 12;
     int64 phone = 13;
+    string correlation_id = 14;
 }
 
 
