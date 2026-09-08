@@ -49,8 +49,7 @@ def product_to_proto(product: models.ProductBase) -> product_pb2.Product:
 
 async def send_kafka_message(topic: str, message):
     producer = AIOKafkaProducer(bootstrap_servers=settings.BOOTSTRAP_SERVER)
-    await producer.start()
-    print("IN PRODUCER IT IS RECIEVING THIS  " + str(message))
+    await retry_async(producer.start)
     try:
         await producer.send_and_wait(topic, message)
         logger.info(f"Message sent to topic {topic}")
