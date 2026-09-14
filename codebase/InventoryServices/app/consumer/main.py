@@ -1,19 +1,14 @@
-# consumer:main.py
-from sqlmodel import Session
-from app import kafka, settings, crud
-from app import db
-from app import inventory_pb2
 import logging
+from uuid import uuid4
+
+from sqlmodel import Session
+
+from app import crud, db, inventory_pb2, kafka, settings
 from app.models import (
-    InventoryItemBase,
     InventoryItem,
-    InventoryItemUpdate,
     InventoryItemCreate,
+    InventoryItemUpdate,
 )
-import asyncio
-
-from app.kafka import send_producer_message
-
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -21,33 +16,22 @@ logger = logging.getLogger(__name__)
 
 async def handle_inventory_check_by_product(product_id: str):
     with Session(db.engine) as session:
-        item = await crud.get_inventory_item_by_product(session, product_id)
-        return item
+        return await crud.get_inventory_item_by_product(session, product_id)
 
 
 async def handle_inventory_check(inventory_id: str):
     with Session(db.engine) as session:
-        item = await crud.get_inventory_item(session, inventory_id)
-        return item
+        return await crud.get_inventory_item(session, inventory_id)
 
 
 async def handle_inventory_stock_level_update(product_id: str, quantity_change: int):
     with Session(db.engine) as session:
-        updated_item = await crud.update_stock_level(
-            session, product_id, quantity_change
-        )
-        return updated_item
+        return await crud.update_stock_level(session, product_id, quantity_change)
 
 
 async def handle_inventory_update(inventory: InventoryItemUpdate, inventory_id: str):
     with Session(db.engine) as session:
-        updated_item = await crud.update_inventory_item(
-            session, inventory_id, inventory
-        )
-        logger.info(
-            f"======= updated yahoo in consumer ==={updated_item}===================="
-        )
-        return updated_item
+        return await crud.update_inventory_item(session, inventory_id, inventory)
 
 
 async def handle_inventory_create(inventory: InventoryItemCreate):
@@ -59,233 +43,212 @@ async def handle_inventory_create(inventory: InventoryItemCreate):
 
 async def handle_inventory_reduce(product_id: str, quantity_change: int):
     with Session(db.engine) as session:
-        updated_item = await crud.reduce_inventory_item(
-            session, product_id, quantity_change
-        )
-        return updated_item
+        return await crud.reduce_inventory_item(session, product_id, quantity_change)
 
 
 async def handle_delete_inventory(inventory_id: str):
     with Session(db.engine) as session:
-        deleted_product = await crud.delete_inventory_item(session, inventory_id)
-        return deleted_product
+        return await crud.delete_inventory_item(session, inventory_id)
 
 
 async def process_message(inventory: inventory_pb2.Inventory):
+    """Commands sent by the HTTP API of this service."""
     try:
-        if inventory.option == inventory_pb2.SelectOption.CHECK:
+        option = inventory.option
+        if option == inventory_pb2.SelectOption.CHECK:
             await handle_inventory_check(inventory.inventory_id)
-        elif inventory.option == inventory_pb2.SelectOption.CREATE:
-            await handle_inventory_create(inventory)
-        elif inventory.option == inventory_pb2.SelectOption.CHECK_BY_PRODUCT:
+        elif option == inventory_pb2.SelectOption.CREATE:
+            await handle_inventory_create(
+                InventoryItemCreate(
+                    inventory_id=inventory.inventory_id or uuid4().hex,
+                    product_id=inventory.product_id,
+                    stock_level=inventory.stock_level,
+                    reserved_stock=inventory.reserved_stock,
+                    sold_stock=inventory.sold_stock,
+                )
+            )
+        elif option == inventory_pb2.SelectOption.CHECK_BY_PRODUCT:
             await handle_inventory_check_by_product(inventory.product_id)
-        elif inventory.option == inventory_pb2.SelectOption.UPDATE:
-            await handle_inventory_update(inventory, inventory.inventory_id)
-        elif inventory.option == inventory_pb2.SelectOption.ADD:
+        elif option == inventory_pb2.SelectOption.UPDATE:
+            # Only the fields that were really sent are changed. Note that a
+            # protobuf int is 0 when unset, so 0 means "not changed" here.
+            changes = {}
+            if inventory.stock_level:
+                changes["stock_level"] = inventory.stock_level
+            if inventory.reserved_stock:
+                changes["reserved_stock"] = inventory.reserved_stock
+            if inventory.sold_stock:
+                changes["sold_stock"] = inventory.sold_stock
+            await handle_inventory_update(
+                InventoryItemUpdate(**changes), inventory.inventory_id
+            )
+        elif option == inventory_pb2.SelectOption.ADD:
             await handle_inventory_stock_level_update(
                 inventory.product_id, inventory.stock_level
             )
-        elif inventory.option == inventory_pb2.SelectOption.REDUCE:
+        elif option == inventory_pb2.SelectOption.REDUCE:
             await handle_inventory_reduce(inventory.product_id, inventory.stock_level)
-        elif inventory.option == inventory_pb2.SelectOption.DELETE:
+        elif option == inventory_pb2.SelectOption.DELETE:
             await handle_delete_inventory(inventory.inventory_id)
-
-        # elif message.option == inventory_pb2.SelectOption.DELETE:
-        #     await handle_delete_inventory(message.inventory_id)
-
         else:
-            logger.warning(f"Unknown option: {inventory.option}")
-    except Exception as e:
-        logger.error(f"Error processing message: {e}")
+            logger.warning(f"Unknown option: {option}")
+    except Exception:
+        logger.exception("Error processing inventory message")
+
+
+async def _publish_stock_level(item: InventoryItem):
+    proto = inventory_pb2.Inventory(
+        product_id=item.product_id, stock_level=item.stock_level
+    )
+    await kafka.send_producer_message(
+        settings.KAFKA_TOPIC_STOCK_LEVEL_CHECK, proto.SerializeToString()
+    )
 
 
 async def process_message_inventory_check(new_msg: inventory_pb2.Order):
-    with Session(db.engine) as session:
-        try:
+    """Request / reply with the order service. The answer always carries the
+    correlation id of the request."""
+    is_product_available = False
+    is_stock_available = False
+    stock_changed_item = None
+    try:
+        with Session(db.engine) as session:
+            # row lock: two orders for the same product cannot oversell the stock
             inventory = await crud.get_inventory_item_by_product(
-                session, new_msg.product_id
+                session, new_msg.product_id, for_update=True
             )
-            is_product_available = False
-            is_stock_available = False
+            quantity = new_msg.quantity
+            option = new_msg.option
 
-            if new_msg.option == inventory_pb2.SelectOption.PAYMENT_DONE:
-                if inventory:
-                    inventory.reserved_stock = max(
-                        inventory.reserved_stock - new_msg.quantity, 0
-                    )
-                    inventory.sold_stock += new_msg.quantity
-                    session.add(inventory)
-                    session.commit()
-                    session.refresh(inventory)
-                else:
-                    logger.warning(
-                        f"Inventory not found for product_id: {new_msg.product_id}"
-                    )
-
-            elif new_msg.option == inventory_pb2.SelectOption.CREATE:
-                if inventory and inventory.stock_level > 0:
+            if inventory is None:
+                logger.warning(f"Inventory not found for product {new_msg.product_id}")
+            elif option == inventory_pb2.SelectOption.PAYMENT_DONE:
+                inventory.reserved_stock = max(inventory.reserved_stock - quantity, 0)
+                inventory.sold_stock += quantity
+                is_product_available = is_stock_available = True
+            elif option == inventory_pb2.SelectOption.CREATE:
+                if inventory.stock_level > 0:
                     is_product_available = True
-                    if inventory.stock_level >= new_msg.quantity:
+                    if quantity > 0 and inventory.stock_level >= quantity:
                         is_stock_available = True
-                        inventory.stock_level -= new_msg.quantity
-                        inventory.reserved_stock += new_msg.quantity
-                        session.add(inventory)
-                        session.commit()
-                        session.refresh(inventory)
-                        inventory_proto = inventory_pb2.Inventory(
-                            product_id=inventory.product_id,
-                            stock_level=inventory.stock_level,
-                        )
-                        serialized_inventory = inventory_proto.SerializeToString()
-                        await kafka.send_producer_message(
-                            settings.KAFKA_TOPIC_STOCK_LEVEL_CHECK, serialized_inventory
-                        )
+                        inventory.stock_level -= quantity
+                        inventory.reserved_stock += quantity
+            elif option == inventory_pb2.SelectOption.UPDATE:
+                # `quantity` is the DIFFERENCE with the quantity already reserved
+                # for this order (positive: reserve more, negative: release).
+                is_product_available = True
+                if quantity > 0:
+                    if inventory.stock_level >= quantity:
+                        is_stock_available = True
+                        inventory.stock_level -= quantity
+                        inventory.reserved_stock += quantity
                 else:
-                    is_stock_available = False
-
-            elif new_msg.option == inventory_pb2.SelectOption.UPDATE:
-                if inventory:
-                    quantity_difference = new_msg.quantity - inventory.reserved_stock
-                    if (
-                        quantity_difference > 0
-                        and inventory.stock_level >= quantity_difference
-                    ):
-                        inventory.stock_level -= quantity_difference
-                        inventory.reserved_stock += quantity_difference
-                        is_stock_available = True
-                    elif quantity_difference < 0:
-                        inventory.stock_level += abs(quantity_difference)
-                        inventory.reserved_stock -= abs(quantity_difference)
-                        is_stock_available = True
-                    else:
-                        is_stock_available = True
-
-                    is_product_available = True
-                    if is_stock_available:
-                        session.add(inventory)
-                        session.commit()
-                        session.refresh(inventory)
-                        inventory_proto = inventory_pb2.Inventory(
-                            product_id=str(inventory.product_id),
-                            stock_level=inventory.stock_level,
-                        )
-                        serialized_inventory = inventory_proto.SerializeToString()
-                        await send_producer_message(
-                            settings.KAFKA_TOPIC_STOCK_LEVEL_CHECK, serialized_inventory
-                        )
-                else:
-                    logger.warning(
-                        f"Inventory not found for product_id: {new_msg.product_id}"
-                    )
-
-            elif new_msg.option == inventory_pb2.SelectOption.DELETE:
-                if inventory:
-                    inventory.stock_level += new_msg.quantity
-                    inventory.reserved_stock = max(
-                        inventory.reserved_stock - new_msg.quantity, 0
-                    )
-                    session.add(inventory)
-                    session.commit()
                     is_stock_available = True
-                    is_product_available = True
-                else:
-                    logger.warning(
-                        f"Inventory not found for product_id: {new_msg.product_id}"
+                    inventory.stock_level += -quantity
+                    inventory.reserved_stock = max(
+                        inventory.reserved_stock + quantity, 0
                     )
-
+            elif option == inventory_pb2.SelectOption.DELETE:
+                inventory.stock_level += quantity
+                inventory.reserved_stock = max(inventory.reserved_stock - quantity, 0)
+                is_product_available = is_stock_available = True
             else:
-                logger.warning(f"Unknown option received: {new_msg.option}")
+                logger.warning(f"Unknown option received: {option}")
 
-            inventory_check_proto = inventory_pb2.Order(
-                is_stock_available=is_stock_available,
-                is_product_available=is_product_available,
-            )
-            serialized_inventory_check_response = (
-                inventory_check_proto.SerializeToString()
-            )
-            await send_producer_message(
-                settings.KAFKA_TOPIC_INVENTORY_CHECK_RESPONSE,
-                serialized_inventory_check_response,
-            )
-        except Exception as e:
-            logger.error(f"Error processing message: {e}")
+            if inventory is not None and (is_stock_available):
+                session.add(inventory)
+                session.commit()
+                session.refresh(inventory)
+                stock_changed_item = inventory
+            else:
+                session.rollback()
+    except Exception:
+        logger.exception("Error processing inventory check")
+
+    answer = inventory_pb2.Order(
+        is_stock_available=is_stock_available,
+        is_product_available=is_product_available,
+        correlation_id=new_msg.correlation_id,
+        product_id=new_msg.product_id,
+    )
+    await kafka.send_producer_message(
+        settings.KAFKA_TOPIC_INVENTORY_CHECK_RESPONSE, answer.SerializeToString()
+    )
+    if stock_changed_item is not None:
+        try:
+            await _publish_stock_level(stock_changed_item)
+        except Exception:
+            logger.exception("Could not publish the new stock level")
 
 
 async def process_message_product(product: inventory_pb2.Product):
-    with Session(db.engine) as session:
-        try:
+    """Events from the product service."""
+    try:
+        with Session(db.engine) as session:
             if product.option == inventory_pb2.SelectOption.CREATE:
-                # Create an inventory item for the newly created product
-                inventory_item = InventoryItemBase(
-                    product_id=product.product_id,
-                    stock_level=0,
-                    reserved_stock=0,
-                    sold_stock=0,
+                if await crud.get_inventory_item_by_product(session, product.product_id):
+                    logger.info("Inventory already exists for this product")
+                    return
+                await crud.create_inventory_item(
+                    session,
+                    InventoryItemCreate(
+                        inventory_id=uuid4().hex,
+                        product_id=product.product_id,
+                        stock_level=0,
+                        reserved_stock=0,
+                        sold_stock=0,
+                    ),
                 )
-                session.add(inventory_item)
-                session.commit()
-                session.refresh(inventory_item)
-                logger.info(
-                    f"Created inventory item for product ID: {product.product_id} successfully"
-                )
-
+                logger.info(f"Created inventory for product {product.product_id}")
             elif product.option == inventory_pb2.SelectOption.DELETE:
-                # Delete the inventory item for the deleted product
-                inventory_item = handle_inventory_check_by_product(product.product_id)
-
-                if inventory_item:
-                    session.delete(inventory_item)
+                item = await crud.get_inventory_item_by_product(
+                    session, product.product_id
+                )
+                if item:
+                    session.delete(item)
                     session.commit()
-
-                    logger.info(
-                        f"Deleted inventory item for product ID: {product.product_id}"
-                    )
+                    logger.info(f"Deleted inventory of product {product.product_id}")
                 else:
-                    logger.warning(
-                        f"No inventory item found for product ID: {product.product_id}"
-                    )
-
+                    logger.warning(f"No inventory for product {product.product_id}")
             else:
                 logger.warning(f"Unknown option: {product.option}")
+    except Exception:
+        logger.exception("Error processing product event")
 
-        except Exception as e:
-            logger.error(f"Error processing message: {e}")
+
+async def _run(consumer, handler):
+    try:
+        async for message in consumer:
+            await handler(message)
+    except Exception:
+        logger.exception("Error in consumer")
 
 
 async def start_consuming():
-    try:
-        consumer = kafka.consume_messages(
+    await _run(
+        kafka.consume_messages(
             settings.KAFKA_TOPIC_INVENTORY,
             settings.KAFKA_CONSUMER_GROUP_ID_FOR_INVENTORY,
-        )
-        async for message in consumer:
-            await process_message(message)
-    except Exception as e:
-        logger.error(f"Error in consumer: {e}")
+        ),
+        process_message,
+    )
 
 
 async def start_consuming_product():
-    try:
-        consumer = kafka.consume_messages_product(
+    await _run(
+        kafka.consume_messages_product(
             settings.KAFKA_TOPIC_GET_PRODUCT,
             settings.KAFKA_CONSUMER_GROUP_ID_FOR_PRODUCT,
-        )
-        async for message in consumer:
-            await process_message_product(message)
-    except Exception as e:
-        logger.error(f"Error in consumer: {e}")
+        ),
+        process_message_product,
+    )
 
 
 async def start_consuming_inventory_check():
-    try:
-        consumer = kafka.consume_messages_inventory_check(
+    await _run(
+        kafka.consume_messages_inventory_check(
             settings.KAFKA_TOPIC_INVENTORY_CHECK_REQUEST,
             settings.KAFKA_CONSUMER_GROUP_ID_FOR_INVENTORY_CHECK,
-        )
-        async for message in consumer:
-            await process_message_inventory_check(message)
-    except Exception as e:
-        logger.error(f"Error in consumer: {e}")
-
-# if __name__ == "__main__":
-#     asyncio.run(start_consuming())
+        ),
+        process_message_inventory_check,
+    )

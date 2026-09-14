@@ -26,6 +26,16 @@ async def create_topic():
             num_partitions=2,
             replication_factor=1,
         ),
+        NewTopic(
+            name=f"{(settings.KAFKA_TOPIC_INVENTORY_CHECK_REQUEST).strip()}",
+            num_partitions=2,
+            replication_factor=1,
+        ),
+        NewTopic(
+            name=f"{(settings.KAFKA_TOPIC_INVENTORY_CHECK_RESPONSE).strip()}",
+            num_partitions=2,
+            replication_factor=1,
+        ),
     ]
     try:
         await admin_client.create_topics(new_topics=topic_list, validate_only=False)

@@ -3,7 +3,7 @@ from typing import Optional
 from uuid import UUID, uuid4
 from sqlmodel import SQLModel, Field
 class InventoryItemBase(SQLModel):
-    inventory_id: str = Field(default_factory=str, index=True, unique=True)
+    inventory_id: str = Field(default_factory=lambda: uuid4().hex, index=True, unique=True)
     product_id: str
     stock_level: int
     reserved_stock: Optional[int] = Field(default=0)

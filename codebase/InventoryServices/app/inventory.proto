@@ -5,14 +5,17 @@ enum SelectOption {
     GET = 0;
     GET_ALL = 1;
     ADD = 2;
-    REDUCE=4;
-    CHECK = 5;
-    UPDATE = 3;
-    DELETE = 6;
-    CREATE=7;
-    PAYMENT_DONE=8;
-    CHECK_BY_PRODUCT=9;
-
+    REGISTER = 3;
+    LOGIN = 4;
+    CURRENT_USER = 5;
+    REFRESH_TOKEN = 6;
+    CREATE = 7;
+    UPDATE = 8;
+    REDUCE = 9;
+    DELETE = 10;
+    PAYMENT_DONE = 11;
+    CHECK = 12;
+    CHECK_BY_PRODUCT = 13;
 }
 
 message Inventory {
@@ -40,6 +43,7 @@ message Product {
     string error_message = 8;
     SelectOption option = 9;
     int64 http_status_code = 10;
+    string category = 11;
 }
 
 message Order {
@@ -61,6 +65,7 @@ message Order {
     PaymentStatus payment_status = 16;
     SelectOption option =17;
     int64 http_status_code = 18;
+    string correlation_id = 19;
 }
 enum OrderStatus {
   IN_PROGRESS = 0;

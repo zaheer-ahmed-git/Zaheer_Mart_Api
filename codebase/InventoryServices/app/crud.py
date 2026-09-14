@@ -23,11 +23,13 @@ async def create_inventory_item(
     return new_item
 
 async def get_inventory_item_by_product(
-    session: Session, product_id: str
+    session: Session, product_id: str, for_update: bool = False
 ) -> Optional[InventoryItem]:
-    return session.exec(
-        select(InventoryItem).where(InventoryItem.product_id == product_id)
-    ).first()
+    statement = select(InventoryItem).where(InventoryItem.product_id == product_id)
+    if for_update:
+        # lock the row until commit: protects against overselling
+        statement = statement.with_for_update()
+    return session.exec(statement).first()
 async def get_inventory_item(
     session: Session, inventory_id: str
 ) -> Optional[InventoryItem]:
@@ -45,15 +47,7 @@ async def update_inventory_item(
         logger.info(
             "----------------------------------inside the update message------------------------------------------------------"
         )
-        new_product = InventoryItemUpdate(
-            sold_stock=item_data.sold_stock,
-            reserved_stock=item_data.reserved_stock,
-            stock_level=item_data.stock_level,
-        )
-        logger.info(
-            f"============================================{new_product}======================"
-        )
-        data = new_product.model_dump(exclude_unset=True)
+        data = item_data.model_dump(exclude_unset=True, exclude_none=True)
         db_item.sqlmodel_update(data)
         session.add(db_item)
         session.commit()
