@@ -1,57 +1,46 @@
-# auth.py
-from passlib.context import CryptContext # type: ignore
-from app import kafka ,db,settings, order_pb2
-from fastapi import Depends,HTTPException
-from fastapi.security import OAuth2PasswordBearer
-from typing import Annotated
-from sqlmodel import SQLModel, Session, select
-from datetime import datetime, timedelta, timezone
-from jose import jwt, JWTError # type: ignore
 import logging
+from typing import Annotated, Optional
 
-# Set up logging
+from fastapi import Depends, HTTPException
+from fastapi.security import OAuth2PasswordBearer
+from jose import JWTError, jwt
+
+from app import settings
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# The login route is /user/login (this service proxies it to the user service).
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/user/login")
 
+ACCESS = "access"
+REFRESH = "refresh"
 
-def verify_access_token(token:Annotated[str,Depends(oauth2_scheme)]):
-    credentials_exception = HTTPException(status_code=401, 
-    detail="Could not validate credentials",
-    headers={"WWW-Authenticate": "Bearer"}   
-    )
-    logger.info(f"Value of token that we receive at verify_access_token :{token}")
+
+def _decode_sub(token: str, expected_type: str) -> Optional[str]:
     try:
-        logger.info(f"Value of token in the try block  :{token}")
-
-        payload = jwt.decode(token, settings.SECRET_KEY, settings.ALGORITHM)
-
-        logger.info(f"Value of payload in the try block  :{payload}")
-        logger.info(f"Value of token under payload  :{token}")
-        username: str| None = payload.get("sub")
-        logger.info(f"Username that we get after decoding token:{username}")
-        if username is None:
-            raise credentials_exception
-        
+        payload = jwt.decode(
+            token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM]
+        )
     except JWTError:
-        return credentials_exception
+        return None
+    if payload.get("type") != expected_type:
+        return None
+    return payload.get("sub")
 
+
+def verify_access_token(token: Annotated[str, Depends(oauth2_scheme)]) -> str:
+    """FastAPI dependency: returns the username, or raises 401."""
+    username = _decode_sub(token, ACCESS)
+    if username is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     return username
 
 
-
-
-# verify refresh token
-def verify_refresh_token(token:str):
-    try:
-        payload = jwt.decode(token, settings.SECRET_KEY, settings.ALGORITHM)
-        return payload.get("sub")
-    except JWTError:
-        return None
-    
-
-
-
-
-
+def verify_refresh_token(token: str) -> Optional[str]:
+    """Returns the email stored in a refresh token, or None."""
+    return _decode_sub(token, REFRESH)

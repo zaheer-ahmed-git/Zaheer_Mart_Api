@@ -1,48 +1,63 @@
-#models.py
 from typing import Optional
-from sqlmodel import SQLModel, Field
+from uuid import uuid4
+
+from pydantic import field_validator
+from sqlmodel import Field, SQLModel
+
+# Single source of truth for the statuses stored in the database.
+ORDER_IN_PROGRESS = "In_progress"
+ORDER_COMPLETED = "Completed"
+ORDER_REJECTED = "Rejected"
+PAYMENT_PENDING = "Pending"
+PAYMENT_DONE = "Payment Done"
+PAYMENT_NOT_REQUIRED = "Not required"
+
+
+def new_order_id() -> str:
+    return uuid4().hex
+
 
 class OrdersBase(SQLModel):
-    order_id: str = Field(default_factory=str,unique=True, index=True)
-    product_id:str  = Field(index=True)
-    user_id:str  = Field(index=True)
-    quantity: int = Field(index=True)
-    shipping_address: str = Field(index=True)
-    customer_notes: str = Field(index=True)
-    order_status: str = Field(default="In_progress", index=True)
-    payment_status: str = Field(default="Pending", index=True)
+    order_id: str = Field(default_factory=new_order_id, unique=True, index=True)
+    product_id: str = Field(index=True)
+    user_id: str = Field(index=True)
+    quantity: int
+    shipping_address: str
+    customer_notes: str = ""
+    order_status: str = Field(default=ORDER_IN_PROGRESS, index=True)
+    payment_status: str = Field(default=PAYMENT_PENDING, index=True)
+
 
 class Orders(OrdersBase, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
 
+
 class OrdersCreate(SQLModel):
-    order_id: str = Field(default_factory=str,unique=True, index=True)
+    """Body of POST /order. The user and the order id are never sent by the client."""
+
     product_id: str
-    user_id: str
     quantity: int
     shipping_address: str
-    customer_notes: str
+    customer_notes: str = ""
+
+    @field_validator("quantity")
+    @classmethod
+    def quantity_must_be_positive(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("quantity must be greater than 0")
+        return value
+
 
 class OrdersUpdate(SQLModel):
+    """Fields a client may change. Statuses are managed by the services only."""
+
     quantity: Optional[int] = None
     shipping_address: Optional[str] = None
     customer_notes: Optional[str] = None
-    order_status: Optional[str] = None
-    payment_status: Optional[str] = None
 
-class UserBase(SQLModel):
-    user_id: str = Field(default_factory=str, index=True)
-    username: str = Field(index=True)
-    email: str = Field(index=True)
-
-class User(UserBase, table=True):
-    id: Optional[int] = Field(default=None, primary_key=True)
-    password: str = Field(index=True)
-
-class UserCreate(UserBase):
-    password: str
-
-class UserUpdate(SQLModel):
-    username: Optional[str] = None
-    email: Optional[str] = None
-    password: Optional[str] = None
+    @field_validator("quantity")
+    @classmethod
+    def quantity_must_be_positive(cls, value: Optional[int]) -> Optional[int]:
+        if value is not None and value <= 0:
+            raise ValueError("quantity must be greater than 0")
+        return value
