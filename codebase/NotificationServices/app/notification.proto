@@ -4,15 +4,17 @@ enum SelectOption {
     GET = 0;
     GET_ALL = 1;
     ADD = 2;
-    REGISTER=3;
-    LOGIN=4;
-    CURRENT_USER=5;
-    REFRESH_TOKEN=6;
+    REGISTER = 3;
+    LOGIN = 4;
+    CURRENT_USER = 5;
+    REFRESH_TOKEN = 6;
     CREATE = 7;
-    UPDATE =8;
+    UPDATE = 8;
     REDUCE = 9;
-    DELETE =10;
+    DELETE = 10;
     PAYMENT_DONE = 11;
+    CHECK = 12;
+    CHECK_BY_PRODUCT = 13;
 }
 
 enum SelectService{
@@ -33,6 +35,9 @@ message User {
     string error_message = 9;
     SelectOption option =10;
     int64 http_status_code = 11;
+    string shipping_address = 12;
+    int64 phone = 13;
+    string correlation_id = 14;
 }
 
 message Inventory {
@@ -59,12 +64,8 @@ message Payment {
     string user_id=4;
     string username =5;
     string email=6;
-    string password =7;
     float amount = 8;
-    int64 card_number = 9;
-    int32 exp_month = 10;
-    int32 exp_year = 11;
-    int32 cvc = 12;
+    reserved 7, 9, 10, 11, 12;
     PaymentStatus payment_status = 13;
     SelectOption option =14;
     int64 http_status_code = 15;

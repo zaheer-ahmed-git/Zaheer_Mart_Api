@@ -1,5 +1,6 @@
 """ Helper functions for Notification Service """
 #handle email.py
+import asyncio
 import logging
 import smtplib
 from email.mime.text import MIMEText
@@ -20,10 +21,13 @@ async def send_email(body: str, subject: str, user_email: str):
         message["From"] = sender_email
         message["To"] = receiver_email
 
-        # Establish secure connection using SMTP_SSL
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(sender_email, password)
-            server.sendmail(sender_email, receiver_email, message.as_string())
+        def _send() -> None:
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+                server.login(sender_email, password)
+                server.sendmail(sender_email, receiver_email, message.as_string())
+
+        # smtplib is blocking: keep it out of the event loop
+        await asyncio.to_thread(_send)
         logger.info("Email sent successfully!")
     except Exception as e:
         logger.error(f"Failed to send email: {e}")

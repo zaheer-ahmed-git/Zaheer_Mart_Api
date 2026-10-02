@@ -9,6 +9,13 @@ from app.models import Notification
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+def _user_id(msg) -> int:
+    raw = getattr(msg, "user_id", "") or ""
+    if str(raw).isdigit():
+        return int(raw)
+    return int(getattr(msg, "id", 0) or 0)
+
+
 async def save_notification(notification: Notification):
     with Session(db.engine) as session:
         session.add(notification)
@@ -24,7 +31,7 @@ Welcome to Online Mart! You have successfully signed in. Explore our wide range 
             body=body, subject=subject, user_email=new_msg.email
         )
         notification = Notification(
-            user_id=new_msg.id,
+            user_id=_user_id(new_msg),
             email=new_msg.email,
             username=new_msg.username,
             title=subject,
@@ -46,15 +53,15 @@ async def start_consuming_user():
 async def process_message_payment(new_msg: notification_pb2.Payment):
     if new_msg.payment_status == notification_pb2.PaymentStatus.PAID:
         body = f"""Hi {new_msg.username},
-Thank you for your purchase! Your payment has been successfully processed. Your order has been dispatched and is on its way! """
+Thank you for your purchase! Your payment has been successfully processed. We will notify you when your order ships."""
         subject = (
-            f"""Payment Confirmation and Order Dispatch Notification from Online Mart"""
+            f"""Payment Confirmation from Online Mart"""
         )
         await handle_email.send_email(
             body=body, subject=subject, user_email=new_msg.email
         )
         notification = Notification(
-            user_id=new_msg.id,
+            user_id=_user_id(new_msg),
             email=new_msg.email,
             username=new_msg.username,
             title=subject,
@@ -84,7 +91,7 @@ Thankyou for your order. Your order has been placed successfully.To Proceed, ple
             body=body, subject=subject, user_email=new_msg.email
         )
         notification = Notification(
-            user_id=new_msg.id,
+            user_id=_user_id(new_msg),
             email=new_msg.email,
             username=new_msg.username,
             title=subject,
