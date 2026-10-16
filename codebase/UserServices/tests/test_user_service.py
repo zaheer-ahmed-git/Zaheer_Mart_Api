@@ -1,18 +1,18 @@
+from datetime import timedelta
+from unittest.mock import AsyncMock, patch
+
 import pytest
 from fastapi.testclient import TestClient
-from sqlmodel import Session, SQLModel, create_engine
 from sqlalchemy.pool import StaticPool
-from app.main import app
-from app.db import get_session
-from app.models import UserClass, UserCreate, USERLOGIN, Usertoken
-from app import crud, kafka, auth, settings, user_pb2
-from unittest.mock import AsyncMock, patch, MagicMock
-from jose import jwt
-from datetime import datetime, timedelta, timezone
-from app.producer import producer
-from app.consumer import main
+from sqlmodel import Session, SQLModel, create_engine
 
-# Setup in-memory test database
+from app import auth, crud, user_pb2
+from app.consumer import main as consumer
+from app.db import get_session
+from app.main import app
+from app.models import UserClass
+
+
 @pytest.fixture(name="session")
 def session_fixture():
     engine = create_engine(
@@ -22,194 +22,136 @@ def session_fixture():
     with Session(engine) as session:
         yield session
 
+
 @pytest.fixture(name="client")
 def client_fixture(session: Session):
-    def get_session_override():
-        return session
-
-    app.dependency_overrides[get_session] = get_session_override
-    client = TestClient(app)
-    yield client
+    app.dependency_overrides[get_session] = lambda: session
+    # no `with`: the lifespan (Kafka) is not started in unit tests
+    yield TestClient(app)
     app.dependency_overrides.clear()
 
-# Test API endpoints
+
+def _add_user(session: Session, username="testuser", email="test@example.com"):
+    user = UserClass(
+        username=username,
+        email=email,
+        password=auth.hash_password("secret"),
+        shipping_address="123 Test St",
+        phone=5555555555,  # larger than a 32-bit integer on purpose
+    )
+    session.add(user)
+    session.commit()
+    session.refresh(user)
+    return user
+
+
+def _auth_header(username="testuser"):
+    return {"Authorization": f"Bearer {auth.generate_token({'sub': username}, timedelta(minutes=5))}"}
+
+
 def test_read_root(client):
-    response = client.get("/")
+    assert client.get("/").json() == {"Hello": "Welcome To User Services **"}
+
+
+def test_endpoints_require_a_token(client):
+    assert client.get("/users/all").status_code == 401
+    assert client.get("/user/a@b.c").status_code == 401
+    assert client.delete("/user/1").status_code == 401
+
+
+def test_refresh_token_is_not_an_access_token(client, session):
+    _add_user(session)
+    refresh = auth.generate_token(
+        {"sub": "test@example.com"}, timedelta(days=1), auth.REFRESH
+    )
+    response = client.get("/users/all", headers={"Authorization": f"Bearer {refresh}"})
+    assert response.status_code == 401
+
+
+def test_password_hash_is_never_returned(client, session):
+    user = _add_user(session)
+    response = client.get(f"/user/{user.email}", headers=_auth_header())
     assert response.status_code == 200
-    assert response.json() == {"Hello": "Welcome To User Services **"}
+    assert "password" not in response.json()
+    assert "password" not in client.get("/user/me", headers=_auth_header()).json()
+    assert all("password" not in u for u in client.get("/users/all", headers=_auth_header()).json())
 
-@pytest.mark.asyncio
-async def test_read_user(client, session):
-    user = UserClass(username="testuser", email="test@example.com", password="password", shipping_address="123 Test St", phone=1234567890)
-    session.add(user)
-    session.commit()
 
-    response = client.get(f"/user/{user.email}")
-    assert response.status_code == 200
-    assert response.json()["email"] == "test@example.com"
+def test_login_returns_both_tokens(client, session):
+    _add_user(session)
+    ok = client.post("/user/login", data={"username": "testuser", "password": "secret"})
+    assert ok.status_code == 200
+    assert {"access_token", "refresh_token"} <= ok.json().keys()
+    bad = client.post("/user/login", data={"username": "testuser", "password": "nope"})
+    assert bad.status_code == 401
 
-@pytest.mark.asyncio
-async def test_detail_of_all_users(client, session):
-    user1 = UserClass(username="user1", email="user1@example.com", password="password1", shipping_address="123 Test St", phone=1234567890)
-    user2 = UserClass(username="user2", email="user2@example.com", password="password2", shipping_address="456 Test Ave", phone=9876543210)
-    session.add(user1)
-    session.add(user2)
-    session.commit()
 
-    response = client.get("/users/all")
-    assert response.status_code == 200
-    assert len(response.json()) == 2
+def test_register_waits_for_the_consumer(client, session):
+    async def fake_publish(register):
+        _add_user(session, register.username, register.email)
 
-@pytest.mark.asyncio
-async def test_register_user(client):
-    with patch('app.producer.publish_user_register', new_callable=AsyncMock) as mock_publish:
-        with patch('app.consumer.main.check_user_in_db', new_callable=AsyncMock) as mock_check_user:
-            with patch('app.crud.get_user_by_username', new_callable=AsyncMock) as mock_get_user:
-                mock_check_user.return_value = None
-                mock_get_user.return_value = UserClass(username="newuser", email="new@example.com", password="password", shipping_address="789 New St", phone=5555555555)
-                
-                user_data = {
-                    "username": "newuser",
-                    "email": "new@example.com",
-                    "password": "password",
-                    "shipping_address": "789 New St",
-                    "phone": 5555555555
-                }
-                response = client.post("/user/register", json=user_data)
-                assert response.status_code == 200
-                assert response.json()["username"] == "newuser"
-                mock_publish.assert_called_once()
-
-@pytest.mark.asyncio
-async def test_delete_user(client):
-    with patch('app.producer.publish_user_delete', new_callable=AsyncMock) as mock_publish:
-        response = client.delete("/user/1")
-        assert response.status_code == 200
-        assert "User with id 1 is deleted successfully" in response.json()["message"]
-        mock_publish.assert_called_once_with(1)
-
-# Test CRUD operations
-@pytest.mark.asyncio
-async def test_get_user_by_username(session):
-    user = UserClass(username="testuser", email="test@example.com", password="password", shipping_address="123 Test St", phone=1234567890)
-    session.add(user)
-    session.commit()
-
-    result = await crud.get_user_by_username(session, "testuser")
-    assert result is not None
-    assert result.username == "testuser"
-
-@pytest.mark.asyncio
-async def test_get_user_by_email(session):
-    user = UserClass(username="testuser", email="test@example.com", password="password", shipping_address="123 Test St", phone=1234567890)
-    session.add(user)
-    session.commit()
-
-    result = await crud.get_user_by_email(session, "test@example.com")
-    assert result is not None
-    assert result.email == "test@example.com"
-
-@pytest.mark.asyncio
-async def test_get_all_users(session):
-    user1 = UserClass(username="user1", email="user1@example.com", password="password1", shipping_address="123 Test St", phone=1234567890)
-    user2 = UserClass(username="user2", email="user2@example.com", password="password2", shipping_address="456 Test Ave", phone=9876543210)
-    session.add(user1)
-    session.add(user2)
-    session.commit()
-
-    result = await crud.get_all_users(session)
-    assert len(result) == 2
-
-# Test auth functions
-def test_hash_password():
-    password = "testpassword"
-    hashed = auth.hash_password(password)
-    assert auth.verify_password(password, hashed)
-
-def test_generate_token():
-    data = {"sub": "testuser"}
-    token = auth.generate_token(data, timedelta(minutes=15))
-    decoded = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-    assert decoded["sub"] == "testuser"
-
-def test_verify_access_token():
-    data = {"sub": "testuser"}
-    token = auth.generate_token(data, timedelta(minutes=15))
-    result = auth.verify_access_token(token)
-    assert result == "testuser"
-
-# Test Kafka producer functions
-@pytest.mark.asyncio
-async def test_publish_user_register():
-    with patch('app.kafka.send_message', new_callable=AsyncMock) as mock_send:
-        user = UserCreate(username="newuser", email="new@example.com", password="password", shipping_address="789 New St", phone=5555555555)
-        await producer.publish_user_register(user)
-        mock_send.assert_called_once()
-
-@pytest.mark.asyncio
-async def test_publish_user_delete():
-    with patch('app.kafka.send_message', new_callable=AsyncMock) as mock_send:
-        await producer.publish_user_delete(1)
-        mock_send.assert_called_once()
-
-# Test Kafka consumer functions
-@pytest.mark.asyncio
-async def test_handle_register_user():
-    with patch('app.consumer.main.check_user_in_db', new_callable=AsyncMock) as mock_check:
-        with patch('sqlmodel.Session') as mock_session:
-            mock_check.return_value = None
-            new_msg = user_pb2.User(
-                username="newuser",
-                email="new@example.com",
-                password="password",
-                shipping_address="789 New St",
-                phone=5555555555
-            )
-            await main.handle_register_user(new_msg)
-            mock_session.return_value.add.assert_called_once()
-            mock_session.return_value.commit.assert_called_once()
-
-@pytest.mark.asyncio
-async def test_handle_login():
-    with patch('app.consumer.main.check_user_in_db', new_callable=AsyncMock) as mock_check:
-        with patch('app.auth.verify_password', return_value=True):
-            with patch('app.auth.generate_token', return_value="test_token"):
-                with patch('app.kafka.send_message', new_callable=AsyncMock) as mock_send:
-                    mock_check.return_value = UserClass(username="testuser", email="test@example.com", password="password" ,shipping_address="address",phone=123)
-                    new_msg = user_pb2.User(
-                        username="testuser",
-                        password="password",
-                        service=user_pb2.SelectService.ORDER
-                    )
-                    await main.handle_login(new_msg)
-                    mock_send.assert_called_once()
-
-# Add more tests for other consumer functions (handle_verify_user, handle_refresh_token, handle_delete_user)
-# as well as the process_message function
-
-# Test the overall message processing flow
-@pytest.mark.asyncio
-async def test_process_message():
-    with patch('app.consumer.main.handle_register_user', new_callable=AsyncMock) as mock_register:
-        new_msg = user_pb2.User(
-            username="newuser",
-            email="new@example.com",
-            password="password",
-            shipping_address="789 New St",
-            phone=5555555555,
-            option=user_pb2.SelectOption.REGISTER
+    with patch("app.main.main.check_user_in_db", AsyncMock(return_value=None)), patch(
+        "app.main.producer.publish_user_register", side_effect=fake_publish
+    ):
+        response = client.post(
+            "/user/register",
+            json={
+                "username": "newuser",
+                "email": "new@example.com",
+                "password": "password",
+                "shipping_address": "789 New St",
+                "phone": 5555555555,
+            },
         )
-        await main.process_message(new_msg)
-        mock_register.assert_called_once_with(new_msg)
+    assert response.status_code == 200
+    assert response.json()["username"] == "newuser"
+    assert "password" not in response.json()
 
-# Add more tests for other message types (LOGIN, CURRENT_USER, REFRESH_TOKEN, DELETE)
+
+def test_cannot_delete_someone_else(client, session):
+    _add_user(session)
+    other = _add_user(session, "other", "other@example.com")
+    with patch("app.main.producer.publish_user_delete", new_callable=AsyncMock) as pub:
+        response = client.delete(f"/user/{other.user_id}", headers=_auth_header())
+    assert response.status_code == 403
+    pub.assert_not_called()
 
 
-# pytest test_user_service.py
+@pytest.mark.asyncio
+async def test_crud(session):
+    _add_user(session)
+    assert (await crud.get_user_by_username(session, "testuser")) is not None
+    assert (await crud.get_user_by_email(session, "test@example.com")) is not None
+    assert len(await crud.get_all_users(session)) == 1
 
-# pytest
-# pytest-asyncio
-# httpx (for TestClient)
-# sqlmodel
-# fastapi
-# pyjwt
+
+def test_tokens_have_a_type():
+    token = auth.generate_token({"sub": "u"}, timedelta(minutes=1), auth.ACCESS)
+    assert auth._decode_sub(token, auth.ACCESS) == "u"
+    assert auth._decode_sub(token, auth.REFRESH) is None
+
+
+@pytest.mark.asyncio
+async def test_login_reply_carries_the_correlation_id():
+    user = UserClass(
+        username="u", email="e@x.c", password=auth.hash_password("pw"),
+        shipping_address="a", phone=1,
+    )
+    request = user_pb2.User(
+        username="u", password="pw", correlation_id="abc",
+        service=user_pb2.SelectService.ORDER, option=user_pb2.SelectOption.LOGIN,
+    )
+    with patch.object(consumer, "check_user_in_db", AsyncMock(return_value=user)), \
+         patch("app.kafka.send_message", new_callable=AsyncMock) as send:
+        await consumer.handle_login(request)
+    topic, payload = send.call_args.args
+    reply = user_pb2.User()
+    reply.ParseFromString(payload)
+    assert reply.correlation_id == "abc"
+    assert reply.access_token and reply.refresh_token
+
+
+def test_enum_values_are_shared_between_services():
+    # LOGIN must have the same number in every service (it is sent as an integer).
+    assert user_pb2.SelectOption.LOGIN == 4
+    assert user_pb2.SelectOption.DELETE == 10

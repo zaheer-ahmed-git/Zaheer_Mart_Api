@@ -1,243 +1,144 @@
+from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, patch
+
 import pytest
 from fastapi.testclient import TestClient
-from httpx import AsyncClient
-from sqlmodel import Session, SQLModel, create_engine
+from jose import jwt
 from sqlalchemy.pool import StaticPool
+from sqlmodel import Session, SQLModel, create_engine
+
+from app import db, models, payment_pb2, settings
+from app.consumer import main as consumer
 from app.main import app
-from app.db import get_session
-from app.models import Payment, PaymentRequest, CheckoutRequest
-from app import crud, kafka, auth, settings, payment_pb2
-from unittest.mock import AsyncMock, patch, MagicMock
-from app.producer import main
-from app.consumer import main
-from app.stripe.payment import create_payment
 
 
-# Setup in-memory test database
-@pytest.fixture(name="session")
-def session_fixture():
+def _token(token_type="access"):
+    return jwt.encode(
+        {
+            "sub": "alice",
+            "type": token_type,
+            "exp": datetime.now(timezone.utc) + timedelta(minutes=5),
+        },
+        settings.SECRET_KEY,
+        algorithm=settings.ALGORITHM,
+    )
+
+
+HEADERS = {"Authorization": f"Bearer {_token()}"}
+USER = payment_pb2.User(user_id="u1", username="alice", email="alice@example.com")
+BODY = {"order_id": "o1", "payment_method_id": "pm_card_visa", "amount": 1500}
+
+
+@pytest.fixture(name="engine")
+def engine_fixture(monkeypatch):
     engine = create_engine(
         "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
     )
     SQLModel.metadata.create_all(engine)
+    monkeypatch.setattr(db, "engine", engine)
+    return engine
+
+
+@pytest.fixture(name="session")
+def session_fixture(engine):
     with Session(engine) as session:
         yield session
 
 
 @pytest.fixture(name="client")
-def client_fixture(session: Session):
-    def get_session_override():
-        return session
-
-    app.dependency_overrides[get_session] = get_session_override
-    client = TestClient(app)
-    yield client
+def client_fixture(session):
+    app.dependency_overrides[db.get_session] = lambda: session
+    yield TestClient(app)
     app.dependency_overrides.clear()
 
 
-@pytest.fixture
-def mock_kafka():
-    with patch("app.kafka.send_kafka_message", new_callable=AsyncMock) as mock_send:
-        with patch(
-            "app.kafka.consume_message_from_user_service", new_callable=AsyncMock
-        ) as mock_consume_user:
-            with patch(
-                "app.consumer.main.consume_payment_response", new_callable=AsyncMock
-            ) as mock_consume_payment:
-                yield mock_send, mock_consume_user, mock_consume_payment
+@pytest.fixture(autouse=True)
+def current_user():
+    with patch("app.user_client.get_user", AsyncMock(return_value=USER)):
+        yield
 
 
-@pytest.fixture
-def mock_stripe():
-    with patch("stripe.PaymentIntent.create") as mock_create:
-        yield mock_create
-
-
-# Test API endpoints
-def test_read_root(client):
-    response = client.get("/")
-    assert response.status_code == 200
-    assert response.json() == {"message": "Payment Management Service Of Mart Api"}
-
-
-@pytest.mark.asyncio
-async def test_payment_request_success(client, mock_kafka):
-    mock_send, mock_consume_user, mock_consume_payment = mock_kafka
-
-    mock_consume_user.return_value = payment_pb2.User(
-        user_id="123", username="testuser", email="test@example.com"
-    )
-    mock_consume_payment.return_value = payment_pb2.Payment(
-        payment_status=payment_pb2.PaymentStatus.PAID
-    )
-
-    payment_request = {
-        "amount": 1000,
-        "card_number": "4242424242424242",
-        "exp_month": 12,
-        "exp_year": 2025,
-        "cvc": "123",
-        "order_id": "order123",
-    }
-
-    response = client.put(
-        "/payment", json=payment_request, headers={"Authorization": "Bearer test_token"}
-    )
-
-    assert response.status_code == 200
-    assert response.json() == {
-        "payment_status": "Paid",
-        "message": "Payment Successful",
-    }
-
-
-@pytest.mark.asyncio
-async def test_payment_request_failure(client, mock_kafka):
-    mock_send, mock_consume_user, mock_consume_payment = mock_kafka
-
-    mock_consume_user.return_value = payment_pb2.User(
-        user_id="123", username="testuser", email="test@example.com"
-    )
-    mock_consume_payment.return_value = payment_pb2.Payment(
-        payment_status=payment_pb2.PaymentStatus.FAILED
-    )
-
-    payment_request = {
-        "amount": 1000,
-        "card_number": "4242424242424242",
-        "exp_month": 12,
-        "exp_year": 2025,
-        "cvc": "123",
-        "order_id": "order123",
-    }
-
-    response = client.put(
-        "/payment", json=payment_request, headers={"Authorization": "Bearer test_token"}
-    )
-
-    assert response.status_code == 200
-    assert response.json() == {
-        "payment_status": "Pending",
-        "message": "Payment Unsuccessful",
-    }
-
-
-@pytest.mark.asyncio
-async def test_create_checkout_session(client, mock_stripe):
-    mock_stripe.return_value = {"id": "test_session_id"}
-
-    checkout_request = {"amount": 1000, "currency": "usd"}
-
-    response = client.post("/create-checkout-session/", json=checkout_request)
-
-    assert response.status_code == 200
-    assert response.json() == {"sessionId": "test_session_id"}
-
-
-# Test CRUD operations
-@pytest.mark.asyncio
-async def test_get_order(session):
-    payment = Payment(
-        order_id="order123",
-        user_id="user123",
-        payment_status="Pending",
-        payment_id="pay123",
-    )
-    session.add(payment)
+def _payment(session, order_id="o1", user_id="u1", status=models.PAYMENT_PENDING):
+    p = models.Payment(order_id=order_id, user_id=user_id, payment_status=status)
+    session.add(p)
     session.commit()
-
-    result = await crud.get_order(session, "order123")
-    assert result is not None
-    assert result.order_id == "order123"
+    return p
 
 
-# Test Stripe payment creation
+def test_root(client):
+    assert client.get("/").status_code == 200
+
+
+def test_payment_requires_a_valid_token(client):
+    assert client.put("/payment", json=BODY).status_code == 401
+    bad = {"Authorization": "Bearer nope"}
+    assert client.put("/payment", json=BODY, headers=bad).status_code == 401
+
+
+def test_card_number_is_not_accepted_anymore(client):
+    # the body has no card_number field: it is just ignored and never forwarded
+    assert "card_number" not in models.PaymentRequest.model_fields
+    assert "cvc" not in models.PaymentRequest.model_fields
+
+
+def test_unknown_or_foreign_order_is_404(client, session):
+    assert client.put("/payment", json=BODY, headers=HEADERS).status_code == 404
+    _payment(session, "o1", user_id="someone-else")
+    assert client.put("/payment", json=BODY, headers=HEADERS).status_code == 404
+
+
+def test_successful_payment(client, session):
+    _payment(session)
+    with patch("app.main.create_payment", AsyncMock(return_value=payment_pb2.PaymentStatus.PAID)), patch(
+        "app.main.publish_payment_result", AsyncMock()
+    ) as publish:
+        r = client.put("/payment", json=BODY, headers=HEADERS)
+    assert r.status_code == 200
+    assert r.json()["payment_status"] == "Paid"
+    publish.assert_awaited_once()
+    assert publish.call_args.kwargs["email"] == "alice@example.com"
+    session.expire_all()
+    assert session.query(models.Payment).first().payment_status == models.PAYMENT_DONE
+
+
+def test_failed_payment_publishes_nothing(client, session):
+    _payment(session)
+    with patch("app.main.create_payment", AsyncMock(return_value=payment_pb2.PaymentStatus.FAILED)), patch(
+        "app.main.publish_payment_result", AsyncMock()
+    ) as publish:
+        r = client.put("/payment", json=BODY, headers=HEADERS)
+    assert r.json()["payment_status"] == "Failed"
+    publish.assert_not_awaited()
+
+
+def test_double_payment_is_refused(client, session):
+    _payment(session, status=models.PAYMENT_DONE)
+    with patch("app.main.create_payment", AsyncMock()) as stripe_call:
+        r = client.put("/payment", json=BODY, headers=HEADERS)
+    assert r.status_code == 409
+    stripe_call.assert_not_awaited()
+
+
+def test_amount_must_be_positive(client):
+    r = client.put("/payment", json={**BODY, "amount": 0}, headers=HEADERS)
+    assert r.status_code == 422
+
+
 @pytest.mark.asyncio
-async def test_create_payment_success():
-    payment_request = PaymentRequest(
-        amount=1000,
-        card_number=4242424242424242,
-        exp_month=12,
-        exp_year=2025,
-        cvc=123,
-        order_id="order123",
+async def test_order_events_create_and_delete_payment_rows(session):
+    created = payment_pb2.Order(
+        order_id="o9", user_id="u1", option=payment_pb2.SelectOption.CREATE
     )
-
-    with patch("stripe.PaymentIntent.create") as mock_create:
-        mock_create.return_value = {"status": "succeeded"}
-        result = await create_payment(payment_request)
-
-    assert result == payment_pb2.PaymentStatus.PAID
-
-
-@pytest.mark.asyncio
-async def test_create_payment_failure():
-    payment_request = PaymentRequest(
-        amount=1000,
-        card_number=4242424242424242,
-        exp_month=12,
-        exp_year=2025,
-        cvc=123,
-        order_id="order123",
+    await consumer.process_order_message(created)
+    await consumer.process_order_message(created)  # idempotent
+    assert session.query(models.Payment).count() == 1
+    await consumer.process_order_message(
+        payment_pb2.Order(order_id="o9", user_id="u1", option=payment_pb2.SelectOption.DELETE)
     )
-
-    with patch("stripe.PaymentIntent.create") as mock_create:
-        mock_create.return_value = {"status": "failed"}
-        result = await create_payment(payment_request)
-
-    assert result == payment_pb2.PaymentStatus.FAILED
+    session.expire_all()
+    assert session.query(models.Payment).count() == 0
 
 
-# Test Kafka consumer functions
-@pytest.mark.asyncio
-async def test_process_order_message_create():
-    with patch("sqlmodel.Session") as mock_session:
-        message = payment_pb2.Order(
-            option=payment_pb2.SelectOption.CREATE,
-            order_id="order123",
-            user_id="user123",
-        )
-
-        await main.process_order_message(message)
-
-        mock_session.return_value.add.assert_called_once()
-        mock_session.return_value.commit.assert_called_once()
-
-
-@pytest.mark.asyncio
-async def test_process_order_message_delete():
-    with patch("sqlmodel.Session") as mock_session:
-        with patch("app.crud.get_order", new_callable=AsyncMock) as mock_get_order:
-            mock_get_order.return_value = Payment(
-                order_id="order123", user_id="user123", payment_id="payment123"
-            )
-
-            message = payment_pb2.Order(
-                option=payment_pb2.SelectOption.DELETE, order_id="order123"
-            )
-
-            await main.process_order_message(message)
-
-            mock_session.return_value.delete.assert_called_once()
-            mock_session.return_value.commit.assert_called_once()
-
-
-# Test the overall message processing flow
-@pytest.mark.asyncio
-async def test_process_message():
-    with patch(
-        "app.consumer.main.handle_create_order", new_callable=AsyncMock
-    ) as mock_create_order:
-        message = payment_pb2.Order(
-            option=payment_pb2.SelectOption.CREATE,
-            order_id="order123",
-            user_id="user123",
-        )
-        await main.process_order_message(message)
-
-        mock_create_order.assert_called_once_with(message)
-
-
-# Add more tests for other message types and scenarios as needed
-
-# Run tests with: pytest test_payment_service.py
+def test_payment_result_message_has_no_card_fields():
+    fields = {f.name for f in payment_pb2.Payment.DESCRIPTOR.fields}
+    assert not fields & {"card_number", "cvc", "exp_month", "exp_year", "password"}

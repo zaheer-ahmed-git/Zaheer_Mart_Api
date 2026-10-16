@@ -1,259 +1,175 @@
-import pytest
-from fastapi.testclient import TestClient
-from sqlmodel import Session, SQLModel, create_engine
-from sqlalchemy.pool import StaticPool
-from app.main import app
-from app.db import get_session
-from app.models import InventoryItem, InventoryItemBase, InventoryItemUpdate
-from app import crud, kafka
 from unittest.mock import AsyncMock, patch
 
-# Setup in-memory test database
-@pytest.fixture(name="session")
-def session_fixture():
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy.pool import StaticPool
+from sqlmodel import Session, SQLModel, create_engine
+
+from app import crud, db, inventory_pb2, models
+from app.consumer import main as consumer
+from app.main import app
+
+
+@pytest.fixture(name="engine")
+def engine_fixture(monkeypatch):
     engine = create_engine(
         "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
     )
     SQLModel.metadata.create_all(engine)
+    monkeypatch.setattr(db, "engine", engine)
+    return engine
+
+
+@pytest.fixture(name="session")
+def session_fixture(engine):
     with Session(engine) as session:
         yield session
 
-@pytest.fixture(name="client")
-def client_fixture(session: Session):
-    def get_session_override():
-        return session
 
-    app.dependency_overrides[get_session] = get_session_override
-    client = TestClient(app)
-    yield client
+@pytest.fixture(name="client")
+def client_fixture(session):
+    app.dependency_overrides[db.get_session] = lambda: session
+    yield TestClient(app)
     app.dependency_overrides.clear()
 
-# Test API endpoints
-def test_main(client):
-    response = client.get("/")
-    assert response.status_code == 200
-    assert response.json() == {"Hello": "Welcome to Inventory Service ."}
 
-def test_see_inventory_item(client, session):
-    item = InventoryItem(inventory_id="test1", product_id="prod1", stock_level=10)
-    session.add(item)
-    session.commit()
+@pytest.fixture(name="sent")
+def sent_fixture():
+    """Capture what the service publishes on Kafka."""
+    sent = []
 
-    response = client.get("/inventory/test1")
-    assert response.status_code == 200
-    assert response.json()["inventory_id"] == "test1"
+    async def fake_send(topic, payload):
+        sent.append((topic, payload))
 
-def test_see_inventory_item_not_found(client):
-    response = client.get("/inventory/nonexistent")
-    assert response.status_code == 404
+    with patch("app.kafka.send_producer_message", fake_send):
+        yield sent
 
-def test_get_all_inventory_items(client, session):
-    item1 = InventoryItem(inventory_id="test1", product_id="prod1", stock_level=10)
-    item2 = InventoryItem(inventory_id="test2", product_id="prod2", stock_level=20)
-    session.add(item1)
-    session.add(item2)
-    session.commit()
 
-    response = client.get("/inventory/")
-    assert response.status_code == 200
-    assert len(response.json()) == 2
-
-@pytest.mark.asyncio
-async def test_create_inventory_item(client):
-    with patch('app.producer.publish_inventory_create', new_callable=AsyncMock) as mock_publish:
-        item_data = {
-            "inventory_id": "new1",
-            "product_id": "prod1",
-            "stock_level": 15,
-            "reserved_stock": 0,
-            "sold_stock": 0
-        }
-        response = client.post("/inventory/create/", json=item_data)
-        assert response.status_code == 200
-        assert "Inventory creation request sent" in response.json()["message"]
-        mock_publish.assert_called_once()
-
-@pytest.mark.asyncio
-async def test_update_inventory_item(client):
-    with patch('app.producer.publish_inventory_update', new_callable=AsyncMock) as mock_publish:
-        update_data = {
-            "stock_level": 25,
-            "reserved_stock": 5,
-            "sold_stock": 10
-        }
-        response = client.put("/inventory/test1/add", json=update_data)
-        assert response.status_code == 200
-        mock_publish.assert_called_once()
-
-@pytest.mark.asyncio
-async def test_delete_inventory_item(client):
-    with patch('app.producer.publish_product_deleted', new_callable=AsyncMock) as mock_publish:
-        response = client.delete("/inventory/test1")
-        assert response.status_code == 200
-        assert "is deleted successfully" in response.json()[0]
-        mock_publish.assert_called_once_with("test1")
-
-@pytest.mark.asyncio
-async def test_update_stock_level(client):
-    with patch('app.producer.publish_inventory_update_stock_level', new_callable=AsyncMock) as mock_publish:
-        response = client.put("/inventory/prod1/update_stock?quantity_change=5")
-        assert response.status_code == 200
-        assert response.json() == {"message": "Stock updated successfully"}
-        mock_publish.assert_called_once()
-
-@pytest.mark.asyncio
-async def test_reduce_stock_level(client):
-    with patch('app.producer.publish_inventory_reduce', new_callable=AsyncMock) as mock_publish:
-        response = client.put("/inventory/prod1/reduce?quantity_change=3")
-        assert response.status_code == 200
-        assert response.json() == {"message": "Stock reduced successfully"}
-        mock_publish.assert_called_once()
-
-# Test CRUD operations
-@pytest.mark.asyncio
-async def test_create_inventory_item_crud(session):
-    item_data = InventoryItemBase(inventory_id="crud1", product_id="prod1", stock_level=30)
-    created_item = await crud.create_inventory_item(session, item_data)
-    assert created_item.inventory_id == "crud1"
-    assert created_item.stock_level == 30
-
-@pytest.mark.asyncio
-async def test_get_inventory_item(session):
-    item = InventoryItem(inventory_id="get1", product_id="prod1", stock_level=40)
-    session.add(item)
-    session.commit()
-
-    retrieved_item = await crud.get_inventory_item(session, "get1")
-    assert retrieved_item is not None
-    assert retrieved_item.inventory_id == "get1"
-
-@pytest.mark.asyncio
-async def test_update_inventory_item_crud(session):
-    item = InventoryItem(inventory_id="update1", product_id="prod1", stock_level=50)
-    session.add(item)
-    session.commit()
-
-    update_data = InventoryItemUpdate(stock_level=55, reserved_stock=5)
-    updated_item = await crud.update_inventory_item(session, "update1", update_data)
-    assert updated_item is not None
-    assert updated_item.stock_level == 55
-    assert updated_item.reserved_stock == 5
-
-@pytest.mark.asyncio
-async def test_delete_inventory_item_crud(session):
-    item = InventoryItem(inventory_id="delete1", product_id="prod1", stock_level=60)
-    session.add(item)
-    session.commit()
-
-    deleted_item = await crud.delete_inventory_item(session, "delete1")
-    assert deleted_item is not None
-    assert deleted_item.inventory_id == "delete1"
-
-    retrieved_item = await crud.get_inventory_item(session, "delete1")
-    assert retrieved_item is None
-
-# Test Kafka message handling
-@pytest.mark.asyncio
-async def test_process_message_create(session):
-    from app.consumer.main import process_message
-    from app import inventory_pb2
-
-    inventory_proto = inventory_pb2.Inventory(
-        inventory_id="kafka1",
-        product_id="prod1",
-        stock_level=70,
-        reserved_stock=0,
-        sold_stock=0,
-        option=inventory_pb2.SelectOption.CREATE
+def _item(session, product_id="p1", stock=10, reserved=0, sold=0):
+    item = models.InventoryItem(
+        inventory_id=f"inv-{product_id}", product_id=product_id,
+        stock_level=stock, reserved_stock=reserved, sold_stock=sold,
     )
-
-    await process_message(inventory_proto)
-    created_item = await crud.get_inventory_item(session, "kafka1")
-    assert created_item is not None
-    assert created_item.stock_level == 70
-
-@pytest.mark.asyncio
-async def test_process_message_update(session):
-    from app.consumer.main import process_message
-    from app import inventory_pb2
-
-    item = InventoryItem(inventory_id="kafka2", product_id="prod2", stock_level=80)
     session.add(item)
     session.commit()
+    return item
 
-    inventory_proto = inventory_pb2.Inventory(
-        inventory_id="kafka2",
-        stock_level=85,
-        reserved_stock=5,
-        sold_stock=10,
-        option=inventory_pb2.SelectOption.UPDATE
-    )
 
-    await process_message(inventory_proto)
-    updated_item = await crud.get_inventory_item(session, "kafka2")
-    assert updated_item is not None
-    assert updated_item.stock_level == 85
-    assert updated_item.reserved_stock == 5
-    assert updated_item.sold_stock == 10
+def _answer(sent):
+    answers = [p for t, p in sent if t == "inv-res"]
+    msg = inventory_pb2.Order()
+    msg.ParseFromString(answers[-1])
+    return msg
 
-@pytest.mark.asyncio
-async def test_process_message_delete(session):
-    from app.consumer.main import process_message
-    from app import inventory_pb2
 
-    item = InventoryItem(inventory_id="kafka3", product_id="prod3", stock_level=90)
-    session.add(item)
-    session.commit()
+def _request(option, quantity, cid="c1"):
+    return inventory_pb2.Order(product_id="p1", quantity=quantity, option=option, correlation_id=cid)
 
-    inventory_proto = inventory_pb2.Inventory(
-        inventory_id="kafka3",
-        option=inventory_pb2.SelectOption.DELETE
-    )
 
-    await process_message(inventory_proto)
-    deleted_item = await crud.get_inventory_item(session, "kafka3")
-    assert deleted_item is None
+def test_routes_do_not_crash(client, session):
+    _item(session)
+    assert client.get("/inventory/inv-p1").json()["stock_level"] == 10
+    assert client.get("/inventory/nope").status_code == 404
+    assert len(client.get("/inventory/").json()) == 1
+    with patch("app.main.producer.publish_product_deleted", new_callable=AsyncMock):
+        r = client.delete("/inventory/inv-p1")
+    assert r.status_code == 202 and "message" in r.json()
+    with patch("app.main.producer.publish_inventory_reduce", new_callable=AsyncMock):
+        assert client.put("/inventory/p1/reduce?quantity_change=1").status_code == 202
+
 
 @pytest.mark.asyncio
-async def test_process_message_inventory_check(session):
-    from app.consumer.main import process_message_inventory_check
-    from app import inventory_pb2
+async def test_create_reserves_stock_and_answers_with_correlation_id(session, sent):
+    _item(session, stock=10)
+    await consumer.process_message_inventory_check(_request(inventory_pb2.SelectOption.CREATE, 4, "abc"))
+    answer = _answer(sent)
+    assert answer.is_stock_available and answer.is_product_available
+    assert answer.correlation_id == "abc"
+    item = await crud.get_inventory_item_by_product(session, "p1")
+    session.refresh(item)
+    assert (item.stock_level, item.reserved_stock) == (6, 4)
 
-    item = InventoryItem(inventory_id="check1", product_id="prod4", stock_level=100, reserved_stock=0)
-    session.add(item)
-    session.commit()
-
-    order_proto = inventory_pb2.Order(
-        product_id="prod4",
-        quantity=10,
-        option=inventory_pb2.SelectOption.CREATE
-    )
-
-    with patch('app.kafka.send_producer_message', new_callable=AsyncMock) as mock_send:
-        await process_message_inventory_check(order_proto)
-        mock_send.assert_called()
-
-    updated_item = await crud.get_inventory_item_by_product(session, "prod4")
-    assert updated_item is not None
-    assert updated_item.stock_level == 90
-    assert updated_item.reserved_stock == 10
 
 @pytest.mark.asyncio
-async def test_process_message_product(session):
-    from app.consumer.main import process_message_product
-    from app import inventory_pb2
+async def test_create_refused_when_not_enough_stock(session, sent):
+    _item(session, stock=3)
+    await consumer.process_message_inventory_check(_request(inventory_pb2.SelectOption.CREATE, 5))
+    assert not _answer(sent).is_stock_available
+    item = await crud.get_inventory_item_by_product(session, "p1")
+    session.refresh(item)
+    assert (item.stock_level, item.reserved_stock) == (3, 0)
 
-    product_proto = inventory_pb2.Product(
-        product_id="new_prod",
-        option=inventory_pb2.SelectOption.CREATE
+
+@pytest.mark.asyncio
+async def test_unknown_product_gets_a_negative_answer(session, sent):
+    await consumer.process_message_inventory_check(_request(inventory_pb2.SelectOption.CREATE, 1))
+    answer = _answer(sent)
+    assert not answer.is_product_available and answer.correlation_id == "c1"
+
+
+@pytest.mark.asyncio
+async def test_update_uses_the_difference(session, sent):
+    _item(session, stock=6, reserved=4)
+    # order grows by 2
+    await consumer.process_message_inventory_check(_request(inventory_pb2.SelectOption.UPDATE, 2))
+    item = await crud.get_inventory_item_by_product(session, "p1")
+    session.refresh(item)
+    assert (item.stock_level, item.reserved_stock) == (4, 6)
+    # order shrinks by 3
+    await consumer.process_message_inventory_check(_request(inventory_pb2.SelectOption.UPDATE, -3))
+    session.refresh(item)
+    assert (item.stock_level, item.reserved_stock) == (7, 3)
+
+
+@pytest.mark.asyncio
+async def test_update_refused_when_difference_exceeds_stock(session, sent):
+    _item(session, stock=1, reserved=4)
+    await consumer.process_message_inventory_check(_request(inventory_pb2.SelectOption.UPDATE, 5))
+    assert not _answer(sent).is_stock_available
+
+
+@pytest.mark.asyncio
+async def test_delete_releases_and_payment_done_sells(session, sent):
+    _item(session, stock=6, reserved=4)
+    await consumer.process_message_inventory_check(_request(inventory_pb2.SelectOption.DELETE, 4))
+    item = await crud.get_inventory_item_by_product(session, "p1")
+    session.refresh(item)
+    assert (item.stock_level, item.reserved_stock) == (10, 0)
+    await consumer.process_message_inventory_check(_request(inventory_pb2.SelectOption.CREATE, 2))
+    await consumer.process_message_inventory_check(_request(inventory_pb2.SelectOption.PAYMENT_DONE, 2))
+    session.refresh(item)
+    assert (item.reserved_stock, item.sold_stock) == (0, 2)
+
+
+@pytest.mark.asyncio
+async def test_product_events_create_and_delete_inventory(session):
+    created = inventory_pb2.Product(product_id="px", option=inventory_pb2.SelectOption.CREATE)
+    await consumer.process_message_product(created)
+    await consumer.process_message_product(created)  # idempotent
+    item = await crud.get_inventory_item_by_product(session, "px")
+    assert item is not None and item.inventory_id and item.stock_level == 0
+    await consumer.process_message_product(
+        inventory_pb2.Product(product_id="px", option=inventory_pb2.SelectOption.DELETE)
     )
+    session.expire_all()
+    assert await crud.get_inventory_item_by_product(session, "px") is None
 
-    await process_message_product(product_proto)
-    created_item = await crud.get_inventory_item_by_product(session, "new_prod")
-    assert created_item is not None
-    assert created_item.stock_level == 0
 
-    product_proto.option = inventory_pb2.SelectOption.DELETE
-    await process_message_product(product_proto)
-    deleted_item = await crud.get_inventory_item_by_product(session, "new_prod")
-    assert deleted_item is None
+@pytest.mark.asyncio
+async def test_partial_update_keeps_other_fields(session):
+    _item(session, stock=10, reserved=2, sold=1)
+    await consumer.process_message(
+        inventory_pb2.Inventory(
+            inventory_id="inv-p1", reserved_stock=5, option=inventory_pb2.SelectOption.UPDATE
+        )
+    )
+    item = await crud.get_inventory_item(session, "inv-p1")
+    session.refresh(item)
+    assert (item.stock_level, item.reserved_stock, item.sold_stock) == (10, 5, 1)
+
+
+def test_enum_numbers_match_the_other_services():
+    assert inventory_pb2.SelectOption.CREATE == 7
+    assert inventory_pb2.SelectOption.UPDATE == 8
+    assert inventory_pb2.SelectOption.DELETE == 10
+    assert inventory_pb2.SelectOption.PAYMENT_DONE == 11

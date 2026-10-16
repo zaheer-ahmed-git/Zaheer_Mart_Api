@@ -1,0 +1,42 @@
+"""Test environment: lets the tests run without a .env file and without Kafka/Postgres."""
+import os
+
+_DEFAULTS = {
+    "SECRET_KEY": "test-secret",
+    "ALGORITHM": "HS256",
+    "JWT_EXPIRY_TIME": "30",
+    "DATABASE_URL": "postgresql://u:p@localhost/db",
+    "BOOTSTRAP_SERVER": "localhost:1",
+    "KAFKA_SERVER": "localhost:1",
+    "STRIPE_API_KEY": "sk_test_dummy",
+    "FROM_EMAIL": "a@b.c",
+    "FROM_EMAIL_APP_PASSWORD": "x",
+    "KAFKA_TOPIC_ORDER": "orders",
+    "KAFKA_TOPIC_ORDER_EVENTS": "order-events",
+    "KAFKA_CONSUMER_GROUP_ID_FOR_ORDER": "g-order",
+    "KAFKA_TOPIC_INVENTORY_CHECK_REQUEST": "inv-req",
+    "KAFKA_TOPIC_INVENTORY_CHECK_RESPONSE": "inv-res",
+    "KAFKA_CONSUMER_GROUP_ID_FOR_INVENTORY_CHECK": "g-inv-check",
+    "KAFKA_TOPIC_REQUEST_TO_USER": "user-requests",
+    "KAFKA_TOPIC_RESPONSE_FROM_USER_TO_ORDER": "user-to-order",
+    "KAFKA_TOPIC_RESPONSE_FROM_USER_TO_PAYMENT": "user-to-payment",
+    "KAFKA_TOPIC_PAYMENT_DONE_FROM_PAYMENT": "payment-done",
+    "KAFKA_CONSUMER_GROUP_ID_FOR_RESPONSE_FROM_PAYMENT": "g-pay-resp",
+    "KAFKA_TOPIC_PAYMENT": "payment-done",
+    "KAFKA_TOPIC_GET_FROM_ORDER": "order-events",
+    "KAFKA_TOPIC_PRODUCT": "products",
+    "KAFKA_CONSUMER_GROUP_ID_FOR_PRODUCT": "g-product",
+    "KAFKA_TOPIC_STOCK_LEVEL_CHECK": "stock",
+    "KAFKA_CONSUMER_GROUP_ID_FOR_STOCK_LEVEL_CHECK": "g-stock",
+    "KAFKA_TOPIC_INVENTORY": "inventory",
+    "KAFKA_CONSUMER_GROUP_ID_FOR_INVENTORY": "g-inventory",
+    "KAFKA_TOPIC_GET_PRODUCT": "products",
+    "KAFKA_TOPIC_TO_CONSUME_NEW_USER": "user-registered",
+    "KAFKA_CONSUMER_GROUP_ID_TO_CONSUME_NEW_USER": "g-nu",
+    "KAFKA_TOPIC_TO_CONSUME_ORDER_CREATED": "order-events",
+    "KAFKA_CONSUMER_GROUP_ID_TO_CONSUME_ORDER_CREATED": "g-no",
+    "KAFKA_TOPIC_TO_CONSUME_PAYMENT_DONE": "payment-done",
+    "KAFKA_CONSUMER_GROUP_ID_TO_CONSUME_PAYMENT_DONE": "g-np",
+}
+for _key, _value in _DEFAULTS.items():
+    os.environ.setdefault(_key, _value)
